@@ -206,6 +206,17 @@ interface AIAgentProvider {
   attachFiles?(sessionId: string, files: AIFileAttachment[]): Promise<void>;
   getMode?(): ProviderMode;
   setMode?(mode: ProviderMode): void;
+  getCliLaunchSpec(): {
+    binary: string;
+    baseArgs?: string[];
+    env?: Record<string, string>;
+  } | null;
+  sdkOneShot(opts: {
+    prompt: string;
+    model?: string;
+    maxTokens?: number;
+    extras?: Record<string, unknown>;
+  }): Promise<{ text: string; usage?: unknown }>;
 }
 
 interface LogIngester {
@@ -1066,6 +1077,49 @@ class OpenCodeProvider implements AIAgentProvider {
   async healthCheck(): Promise<{ ok: boolean; message?: string }> {
     const adapter = this.getAdapter();
     return adapter.healthCheck();
+  }
+
+  // ── `vibe ai run` / `vibe ai sdk` integration ────────────────────────
+
+  getCliLaunchSpec(): {
+    binary: string;
+    baseArgs?: string[];
+    env?: Record<string, string>;
+  } | null {
+    const env: Record<string, string> = {};
+    const port = process.env["OPENCODE_PORT"]?.trim();
+    const url = process.env["OPENCODE_URL"]?.trim();
+    if (port) env["OPENCODE_PORT"] = port;
+    if (url) env["OPENCODE_URL"] = url;
+    return { binary: CLI_COMMAND, env };
+  }
+
+  async sdkOneShot(opts: {
+    prompt: string;
+    model?: string;
+    maxTokens?: number;
+    extras?: Record<string, unknown>;
+  }): Promise<{ text: string; usage?: unknown }> {
+    const port = process.env["OPENCODE_PORT"] || String(DEFAULT_PORT);
+    const baseUrl = process.env["OPENCODE_URL"] || `http://localhost:${port}`;
+    const adapter = new OpenCodeSdkAdapter(baseUrl);
+    const model = opts.model ?? DEFAULT_MODEL;
+    const config: AISessionConfig = {
+      name: "vibe-ai-sdk",
+      agentType: PROVIDER_NAME,
+      model,
+      maxTokens: opts.maxTokens,
+      providerConfig: opts.extras,
+    };
+    const result = await adapter.sendPrompt(opts.prompt, model, config);
+    return {
+      text: result.content,
+      usage: {
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
+        model,
+      },
+    };
   }
 
   // ── Private Helpers ─────────────────────────────────────────────────
