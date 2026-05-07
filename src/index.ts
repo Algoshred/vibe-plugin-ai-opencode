@@ -43,7 +43,18 @@ interface AIFileAttachment {
   size: number;
 }
 
+interface PluginCapabilities {
+  storage?: "none" | "read" | "rw";
+  secrets?: "none" | "read" | "rw";
+  gateway?: boolean;
+  broadcast?: boolean;
+  subprocess?: boolean;
+  audit?: boolean;
+  telemetry?: boolean;
+}
+
 interface VibePlugin {
+  capabilities?: PluginCapabilities;
   name: string;
   version: string;
   description?: string;
@@ -72,6 +83,9 @@ interface VibePlugin {
 }
 
 interface HostServices {
+  telemetry?: {
+    emit: (name: string, payload?: Record<string, unknown>) => void;
+  };
   logger?: {
     info: (source: string, msg: string) => void;
     warn: (source: string, msg: string) => void;
@@ -270,6 +284,21 @@ interface ProviderAdapter {
 
 const PROVIDER_NAME = "opencode";
 const CLI_COMMAND = "opencode";
+/**
+ * Resolve CLI binary path with platform-correct extension.
+ * On Windows, Bun.spawn calls CreateProcess directly (no PATHEXT), so a bare
+ * name won't find `name.exe`/`name.cmd`. Bun.which searches PATH like the shell.
+ */
+function resolveCliBin(): string {
+  const found =
+    typeof Bun !== "undefined" && typeof Bun.which === "function"
+      ? Bun.which(CLI_COMMAND)
+      : null;
+  if (found) return found;
+  return process.platform === "win32" ? `${CLI_COMMAND}.exe` : CLI_COMMAND;
+}
+const CLI_BIN = resolveCliBin();
+
 const DISPLAY_NAME = "OpenCode";
 const DEFAULT_MODEL = "anthropic/claude-sonnet-4-20250514";
 const DEFAULT_PORT = 3100;
@@ -586,7 +615,7 @@ class OpenCodeCliAdapter implements ProviderAdapter {
     metadata?: Record<string, unknown>;
   }> {
     const args = this.buildArgs(model, prompt);
-    const proc = Bun.spawn([CLI_COMMAND, ...args], {
+    const proc = Bun.spawn([CLI_BIN, ...args], {
       stdout: "pipe",
       stderr: "pipe",
       cwd: config.workingDirectory || process.cwd(),
@@ -627,7 +656,7 @@ class OpenCodeCliAdapter implements ProviderAdapter {
     metadata?: Record<string, unknown>;
   }> {
     const args = this.buildArgs(model, prompt);
-    const proc = Bun.spawn([CLI_COMMAND, ...args], {
+    const proc = Bun.spawn([CLI_BIN, ...args], {
       stdout: "pipe",
       stderr: "pipe",
       cwd: config.workingDirectory || process.cwd(),
@@ -665,7 +694,7 @@ class OpenCodeCliAdapter implements ProviderAdapter {
 
   async healthCheck(): Promise<{ ok: boolean; message?: string }> {
     try {
-      const proc = Bun.spawnSync([CLI_COMMAND, "--version"], {
+      const proc = Bun.spawnSync([CLI_BIN, "--version"], {
         timeout: 5000,
         stdout: "pipe",
         stderr: "ignore",
@@ -690,7 +719,7 @@ class OpenCodeCliAdapter implements ProviderAdapter {
 
   async listModels(): Promise<AIModelInfo[]> {
     try {
-      const proc = Bun.spawnSync([CLI_COMMAND, "models"], {
+      const proc = Bun.spawnSync([CLI_BIN, "models"], {
         timeout: 10_000,
         stdout: "pipe",
         stderr: "ignore",
@@ -1245,7 +1274,7 @@ class OpenCodeProvider implements AIAgentProvider {
 
 function getCliVersion(): string | null {
   try {
-    const proc = Bun.spawnSync([CLI_COMMAND, "--version"], {
+    const proc = Bun.spawnSync([CLI_BIN, "--version"], {
       timeout: 5000,
       stdout: "pipe",
       stderr: "ignore",
@@ -1317,6 +1346,12 @@ function createPrereqsRoutes() {
 const provider = new OpenCodeProvider();
 
 export const vibePlugin: VibePlugin = {
+  capabilities: {
+    secrets: "read",
+    subprocess: true,
+    gateway: false,
+    telemetry: true,
+  },
   name: "opencode",
   version: "1.0.0",
   description:
@@ -1335,6 +1370,7 @@ export const vibePlugin: VibePlugin = {
   createRoutes: () => createPrereqsRoutes(),
 
   onServerStart(_app, hostServices) {
+    hostServices?.telemetry?.emit("ai.provider.ready", { provider: "opencode" });
     if (hostServices) provider.setHostServices(hostServices);
   },
 
