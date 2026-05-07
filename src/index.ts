@@ -260,11 +260,53 @@ interface ProviderAdapter {
 const PROVIDER_NAME = "opencode";
 const CLI_COMMAND = "opencode";
 const DISPLAY_NAME = "OpenCode";
-const DEFAULT_MODEL = "default";
+const DEFAULT_MODEL = "anthropic/claude-sonnet-4-20250514";
 const DEFAULT_PORT = 3100;
 const API_PREFIX = `/api/ai-${PROVIDER_NAME}`;
 const SUPPORTED_MODES: ProviderMode[] = ["sdk", "cli"];
 const CLI_INSTALL_COMMAND = ["npm", "install", "-g", "opencode"];
+
+const OPENCODE_FALLBACK_MODELS = [
+  "anthropic/claude-sonnet-4-20250514",
+  "anthropic/claude-sonnet-4-5-20250929",
+  "openai/gpt-5.5",
+  "openai/gpt-5.5-pro",
+  "openrouter/anthropic/claude-sonnet-4",
+  "openrouter/openai/gpt-5.5",
+  "openrouter/google/gemini-2.5-flash",
+  "opencode/claude-sonnet-4",
+  "opencode/claude-sonnet-4-5",
+  "opencode/gpt-5.5",
+  "opencode/gpt-5.5-pro",
+  "opencode/gemini-3-flash",
+];
+
+const ANSI_ESCAPE_RE = new RegExp(
+  `${String.fromCharCode(27)}(?:[@-Z\\-_]|\\[[0-?]*[ -/]*[@-~])`,
+  "g",
+);
+
+function stripAnsi(value: string): string {
+  return value.replace(ANSI_ESCAPE_RE, "");
+}
+
+function toOpenCodeModelInfo(id: string): AIModelInfo {
+  return {
+    id,
+    name: id,
+    provider: PROVIDER_NAME,
+    contextWindow: 0,
+    maxOutputTokens: 0,
+    supportsVision: false,
+    supportsStreaming: true,
+    inputPricePerMToken: 0,
+    outputPricePerMToken: 0,
+  };
+}
+
+function fallbackModels(): AIModelInfo[] {
+  return OPENCODE_FALLBACK_MODELS.map(toOpenCodeModelInfo);
+}
 
 // ── OpenCode API response types ─────────────────────────────────────────
 
@@ -540,8 +582,8 @@ class OpenCodeCliAdapter implements ProviderAdapter {
       timeout: (config.providerConfig?.timeoutMs as number) || 300_000,
     });
 
-    const stdout = await new Response(proc.stdout).text();
-    const stderr = await new Response(proc.stderr).text();
+    const stdout = stripAnsi(await new Response(proc.stdout).text());
+    const stderr = stripAnsi(await new Response(proc.stderr).text());
     const exitCode = await proc.exited;
 
     if (exitCode !== 0 && !stdout) {
@@ -588,7 +630,7 @@ class OpenCodeCliAdapter implements ProviderAdapter {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        const text = new TextDecoder().decode(value);
+        const text = stripAnsi(new TextDecoder().decode(value));
         fullContent += text;
         onChunk({ type: "text", content: text });
       }
@@ -632,6 +674,30 @@ class OpenCodeCliAdapter implements ProviderAdapter {
         ok: false,
         message: `${DISPLAY_NAME} CLI not installed or not in PATH`,
       };
+    }
+  }
+
+  async listModels(): Promise<AIModelInfo[]> {
+    try {
+      const proc = Bun.spawnSync([CLI_COMMAND, "models"], {
+        timeout: 10_000,
+        stdout: "pipe",
+        stderr: "ignore",
+      });
+
+      if (proc.exitCode !== 0) return fallbackModels();
+
+      const models = proc.stdout
+        .toString()
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0 && line.includes("/"));
+
+      return models.length > 0
+        ? models.map(toOpenCodeModelInfo)
+        : fallbackModels();
+    } catch {
+      return fallbackModels();
     }
   }
 
@@ -710,13 +776,14 @@ class OpenCodeProvider implements AIAgentProvider {
       mcpSupport: true,
       voiceMode: false,
       cancelSupport: true,
-      modelListing: false,
+      modelListing: true,
     };
   }
 
   async listModels(): Promise<AIModelInfo[]> {
-    // OpenCode models depend on its configured provider; we cannot enumerate them
-    return [];
+    const adapter = this.getAdapter();
+    if (adapter.listModels) return adapter.listModels();
+    return fallbackModels();
   }
 
   async cancelRequest(sessionId: string): Promise<void> {
@@ -843,8 +910,6 @@ class OpenCodeProvider implements AIAgentProvider {
     const model = session.config.model || DEFAULT_MODEL;
     const adapter = this.getAdapter();
 
-    this.logIngester?.append({ sessionId, type: "input", content: prompt });
-
     try {
       const result = await adapter.sendPrompt(
         fullPrompt,
@@ -862,15 +927,6 @@ class OpenCodeProvider implements AIAgentProvider {
       session.status = "active";
       session.updatedAt = new Date().toISOString();
 
-      this.logIngester?.append({
-        sessionId,
-        type: "output",
-        content: result.content,
-        tokenCount: result.outputTokens,
-        model,
-        durationMs,
-      });
-
       return {
         content: result.content,
         model,
@@ -882,8 +938,6 @@ class OpenCodeProvider implements AIAgentProvider {
     } catch (err) {
       session.status = "error";
       session.updatedAt = new Date().toISOString();
-      const errorMsg = err instanceof Error ? err.message : "Unknown error";
-      this.logIngester?.append({ sessionId, type: "error", content: errorMsg });
       throw err;
     }
   }
@@ -908,8 +962,6 @@ class OpenCodeProvider implements AIAgentProvider {
     const model = session.config.model || DEFAULT_MODEL;
     const adapter = this.getAdapter();
 
-    this.logIngester?.append({ sessionId, type: "input", content: prompt });
-
     try {
       const result = await adapter.streamPrompt(
         fullPrompt,
@@ -929,15 +981,6 @@ class OpenCodeProvider implements AIAgentProvider {
       session.abortController = null;
       session.updatedAt = new Date().toISOString();
 
-      this.logIngester?.append({
-        sessionId,
-        type: "output",
-        content: result.content,
-        tokenCount: result.outputTokens,
-        model,
-        durationMs,
-      });
-
       return {
         content: result.content,
         model,
@@ -950,8 +993,6 @@ class OpenCodeProvider implements AIAgentProvider {
       session.status = "error";
       session.abortController = null;
       session.updatedAt = new Date().toISOString();
-      const errorMsg = err instanceof Error ? err.message : "Unknown error";
-      this.logIngester?.append({ sessionId, type: "error", content: errorMsg });
       throw err;
     }
   }
