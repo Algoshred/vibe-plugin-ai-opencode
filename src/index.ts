@@ -1184,14 +1184,8 @@ class OpenCodeProvider implements AIAgentProvider {
 
     // CLI mode: check if the opencode binary exists
     try {
-      // Cross-platform: `which` on POSIX, `where.exe` on Windows.
-      const finder = process.platform === "win32" ? "where.exe" : "which";
-      const proc = Bun.spawnSync([finder, CLI_COMMAND], {
-        timeout: 3000,
-        stdout: "pipe",
-        stderr: "ignore",
-      });
-      if (proc.exitCode === 0) {
+      // Cross-platform binary discovery via Bun.which (handles PATHEXT on Windows).
+      if (Bun.which(CLI_COMMAND)) {
         this.currentMode = "cli";
         this.log("info", "Auto-detected CLI mode (opencode binary found)");
         return;
