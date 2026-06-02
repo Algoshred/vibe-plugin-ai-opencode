@@ -6,6 +6,9 @@
  * Auto-detects mode based on available resources.
  */
 
+import { mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Elysia } from "elysia";
 import type {
   HostServices,
@@ -281,13 +284,40 @@ const OPENCODE_FALLBACK_MODELS = [
   "opencode/gemini-3-flash",
 ];
 
-const ANSI_ESCAPE_RE = new RegExp(
-  `${String.fromCharCode(27)}(?:[@-Z\\-_]|\\[[0-?]*[ -/]*[@-~])`,
-  "g",
-);
+/** The OpenCode server message response: `{ info: {...}, parts: [...] }`. */
+interface OpenCodeMessageResponse {
+  info?: {
+    modelID?: string;
+    tokens?: { input?: number; output?: number };
+  };
+  parts?: Array<{ type?: string; text?: string }>;
+}
 
-function stripAnsi(value: string): string {
-  return value.replace(ANSI_ESCAPE_RE, "");
+/**
+ * Split a `provider/model` id into the `{ providerID, modelID }` shape the
+ * OpenCode server expects. The provider is the first segment; everything after
+ * the first `/` is the model id (model ids can themselves contain slashes,
+ * e.g. `openrouter/openai/gpt-4o-mini`).
+ */
+function splitOpenCodeModel(model: string): {
+  providerID: string;
+  modelID: string;
+} {
+  const slash = model.indexOf("/");
+  if (slash === -1) return { providerID: "opencode", modelID: model };
+  return {
+    providerID: model.slice(0, slash),
+    modelID: model.slice(slash + 1),
+  };
+}
+
+/** Concatenate the text parts of an OpenCode assistant message. */
+function extractMessageText(data: OpenCodeMessageResponse): string {
+  return (data.parts ?? [])
+    .filter((p) => p.type === "text" && typeof p.text === "string")
+    .map((p) => p.text ?? "")
+    .join("")
+    .trim();
 }
 
 function toOpenCodeModelInfo(id: string): AIModelInfo {
@@ -308,48 +338,27 @@ function fallbackModels(): AIModelInfo[] {
   return OPENCODE_FALLBACK_MODELS.map(toOpenCodeModelInfo);
 }
 
-// ── OpenCode API response types ─────────────────────────────────────────
-
-interface OpenCodeSessionResponse {
-  id: string;
-  model?: string;
-  [key: string]: unknown;
-}
-
-interface OpenCodePromptResponse {
-  content?: string;
-  text?: string;
-  response?: string;
-  usage?: {
-    promptTokens?: number;
-    completionTokens?: number;
-    inputTokens?: number;
-    outputTokens?: number;
-  };
-  model?: string;
-  [key: string]: unknown;
-}
-
 // ── SDK Adapter (HTTP API) ──────────────────────────────────────────────
 
 class OpenCodeSdkAdapter implements ProviderAdapter {
-  private baseUrl: string;
+  private readonly resolveBaseUrl: () => Promise<string>;
 
-  constructor(baseUrl: string) {
-    this.baseUrl = baseUrl;
+  /**
+   * Takes an async resolver so the managed `opencode serve` is started lazily
+   * on first use (and an explicit OPENCODE_URL still wins). Each request
+   * resolves the live base URL before calling the server.
+   */
+  constructor(resolveBaseUrl: () => Promise<string>) {
+    this.resolveBaseUrl = resolveBaseUrl;
   }
 
-  async createRemoteSession(config: AISessionConfig): Promise<string> {
-    const body: Record<string, unknown> = {};
-    if (config.model) body.model = config.model;
-    if (config.systemPrompt) body.systemPrompt = config.systemPrompt;
-    if (config.workingDirectory)
-      body.workingDirectory = config.workingDirectory;
-
-    const res = await fetch(`${this.baseUrl}/api/sessions`, {
+  async createRemoteSession(_config: AISessionConfig): Promise<string> {
+    const baseUrl = await this.resolveBaseUrl();
+    // OpenCode server: POST /session creates a session and returns { id, ... }.
+    const res = await fetch(`${baseUrl}/session`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: "{}",
     });
 
     if (!res.ok) {
@@ -359,13 +368,14 @@ class OpenCodeSdkAdapter implements ProviderAdapter {
       );
     }
 
-    const data = (await res.json()) as OpenCodeSessionResponse;
+    const data = (await res.json()) as { id: string };
     return data.id;
   }
 
   async destroyRemoteSession(remoteSessionId: string): Promise<void> {
     try {
-      await fetch(`${this.baseUrl}/api/sessions/${remoteSessionId}`, {
+      const baseUrl = await this.resolveBaseUrl();
+      await fetch(`${baseUrl}/session/${remoteSessionId}`, {
         method: "DELETE",
       });
     } catch {
@@ -375,7 +385,7 @@ class OpenCodeSdkAdapter implements ProviderAdapter {
 
   async sendPrompt(
     prompt: string,
-    _model: string,
+    model: string,
     _config: AISessionConfig,
     remoteSessionId?: string,
   ): Promise<{
@@ -390,44 +400,47 @@ class OpenCodeSdkAdapter implements ProviderAdapter {
       throw new Error("Remote session ID is required for SDK mode");
     }
 
-    const res = await fetch(
-      `${this.baseUrl}/api/sessions/${sessionId}/prompt`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt }),
-      },
-    );
+    const baseUrl = await this.resolveBaseUrl();
+    // OpenCode server: POST /session/{id}/message runs the prompt to completion
+    // and returns { info: {...usage...}, parts: [{type:"text",text}, ...] }.
+    const res = await fetch(`${baseUrl}/session/${sessionId}/message`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        parts: [{ type: "text", text: prompt }],
+        model: splitOpenCodeModel(model),
+      }),
+    });
 
     if (!res.ok) {
       const errText = await res.text();
       throw new Error(`OpenCode prompt failed (${res.status}): ${errText}`);
     }
 
-    const data = (await res.json()) as OpenCodePromptResponse;
-    const content = data.content ?? data.text ?? data.response ?? "";
+    const data = (await res.json()) as OpenCodeMessageResponse;
+    const content = extractMessageText(data);
     const inputTokens =
-      data.usage?.promptTokens ??
-      data.usage?.inputTokens ??
-      Math.ceil(prompt.length / 4);
+      data.info?.tokens?.input ?? Math.ceil(prompt.length / 4);
     const outputTokens =
-      data.usage?.completionTokens ??
-      data.usage?.outputTokens ??
-      Math.ceil(content.length / 4);
+      data.info?.tokens?.output ?? Math.ceil(content.length / 4);
 
     return {
       content,
       inputTokens,
       outputTokens,
       remoteSessionId: sessionId,
-      metadata: { mode: "sdk", provider: PROVIDER_NAME, model: data.model },
+      metadata: {
+        mode: "sdk",
+        provider: PROVIDER_NAME,
+        model: data.info?.modelID,
+      },
     };
   }
 
   async streamPrompt(
     prompt: string,
-    _model: string,
-    _config: AISessionConfig,
+    model: string,
+    config: AISessionConfig,
     onChunk: (chunk: AIStreamChunk) => void,
     remoteSessionId?: string,
   ): Promise<{
@@ -437,103 +450,24 @@ class OpenCodeSdkAdapter implements ProviderAdapter {
     remoteSessionId?: string;
     metadata?: Record<string, unknown>;
   }> {
-    const sessionId = remoteSessionId;
-    if (!sessionId) {
-      throw new Error("Remote session ID is required for SDK mode streaming");
-    }
-
-    const res = await fetch(
-      `${this.baseUrl}/api/sessions/${sessionId}/prompt`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "text/event-stream",
-        },
-        body: JSON.stringify({ prompt, stream: true }),
-      },
+    // The OpenCode message endpoint runs to completion server-side; emit the
+    // final assistant text as a single chunk so the streaming contract holds.
+    const result = await this.sendPrompt(
+      prompt,
+      model,
+      config,
+      remoteSessionId,
     );
-
-    if (!res.ok) {
-      const errText = await res.text();
-      throw new Error(
-        `OpenCode stream prompt failed (${res.status}): ${errText}`,
-      );
-    }
-
-    let fullContent = "";
-
-    if (res.body) {
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-
-          // Parse SSE lines
-          const lines = buffer.split(/\r?\n/);
-          buffer = lines.pop() ?? "";
-
-          for (const line of lines) {
-            if (line.startsWith("data: ")) {
-              const dataStr = line.slice(6).trim();
-              if (dataStr === "[DONE]") continue;
-
-              try {
-                const parsed = JSON.parse(dataStr) as {
-                  content?: string;
-                  text?: string;
-                  type?: string;
-                };
-                const text = parsed.content ?? parsed.text ?? "";
-                if (text) {
-                  fullContent += text;
-                  onChunk({ type: "text", content: text });
-                }
-              } catch {
-                // Non-JSON SSE data -- treat as raw text
-                if (dataStr) {
-                  fullContent += dataStr;
-                  onChunk({ type: "text", content: dataStr });
-                }
-              }
-            }
-          }
-        }
-      } finally {
-        reader.releaseLock();
-      }
-    } else {
-      // Fallback: non-streaming response body
-      const data = (await res.json()) as OpenCodePromptResponse;
-      fullContent = data.content ?? data.text ?? data.response ?? "";
-      if (fullContent) {
-        onChunk({ type: "text", content: fullContent });
-      }
-    }
-
+    if (result.content) onChunk({ type: "text", content: result.content });
     onChunk({ type: "done", content: "" });
-
-    const inputTokens = Math.ceil(prompt.length / 4);
-    const outputTokens = Math.ceil(fullContent.length / 4);
-
-    return {
-      content: fullContent,
-      inputTokens,
-      outputTokens,
-      remoteSessionId: sessionId,
-      metadata: { mode: "sdk", provider: PROVIDER_NAME },
-    };
+    return result;
   }
 
   async healthCheck(): Promise<{ ok: boolean; message?: string }> {
+    let baseUrl = "";
     try {
-      const res = await fetch(`${this.baseUrl}/api/health`, {
+      baseUrl = await this.resolveBaseUrl();
+      const res = await fetch(`${baseUrl}/api/health`, {
         method: "GET",
         signal: AbortSignal.timeout(5000),
       });
@@ -541,7 +475,7 @@ class OpenCodeSdkAdapter implements ProviderAdapter {
       if (res.ok) {
         return {
           ok: true,
-          message: `${DISPLAY_NAME} HTTP API reachable at ${this.baseUrl} (mode: sdk)`,
+          message: `${DISPLAY_NAME} HTTP API reachable at ${baseUrl} (mode: sdk)`,
         };
       }
       return {
@@ -551,161 +485,13 @@ class OpenCodeSdkAdapter implements ProviderAdapter {
     } catch {
       return {
         ok: false,
-        message: `${DISPLAY_NAME} API not reachable at ${this.baseUrl}`,
+        message: `${DISPLAY_NAME} API not reachable${baseUrl ? ` at ${baseUrl}` : ""}`,
       };
     }
   }
 
   cancel(_abortController: AbortController): void {
     _abortController.abort();
-  }
-}
-
-// ── CLI Adapter ─────────────────────────────────────────────────────────
-
-class OpenCodeCliAdapter implements ProviderAdapter {
-  async sendPrompt(
-    prompt: string,
-    model: string,
-    config: AISessionConfig,
-  ): Promise<{
-    content: string;
-    inputTokens: number;
-    outputTokens: number;
-    metadata?: Record<string, unknown>;
-  }> {
-    const args = this.buildArgs(model, prompt);
-    const proc = Bun.spawn([CLI_BIN, ...args], {
-      stdout: "pipe",
-      stderr: "pipe",
-      cwd: config.workingDirectory || process.cwd(),
-      timeout: (config.providerConfig?.timeoutMs as number) || 300_000,
-    });
-
-    const stdout = stripAnsi(await new Response(proc.stdout).text());
-    const stderr = stripAnsi(await new Response(proc.stderr).text());
-    const exitCode = await proc.exited;
-
-    if (exitCode !== 0 && !stdout) {
-      throw new Error(
-        `${DISPLAY_NAME} CLI exited with code ${exitCode}: ${stderr}`,
-      );
-    }
-
-    const content = stdout.trim() || stderr.trim();
-    const inputTokens = Math.ceil(prompt.length / 4);
-    const outputTokens = Math.ceil(content.length / 4);
-
-    return {
-      content,
-      inputTokens,
-      outputTokens,
-      metadata: { mode: "cli", exitCode, provider: PROVIDER_NAME },
-    };
-  }
-
-  async streamPrompt(
-    prompt: string,
-    model: string,
-    config: AISessionConfig,
-    onChunk: (chunk: AIStreamChunk) => void,
-  ): Promise<{
-    content: string;
-    inputTokens: number;
-    outputTokens: number;
-    metadata?: Record<string, unknown>;
-  }> {
-    const args = this.buildArgs(model, prompt);
-    const proc = Bun.spawn([CLI_BIN, ...args], {
-      stdout: "pipe",
-      stderr: "pipe",
-      cwd: config.workingDirectory || process.cwd(),
-      timeout: (config.providerConfig?.timeoutMs as number) || 300_000,
-    });
-
-    let fullContent = "";
-    const reader = proc.stdout.getReader();
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const text = stripAnsi(new TextDecoder().decode(value));
-        fullContent += text;
-        onChunk({ type: "text", content: text });
-      }
-    } finally {
-      reader.releaseLock();
-    }
-
-    await proc.exited;
-    onChunk({ type: "done", content: "" });
-
-    const inputTokens = Math.ceil(prompt.length / 4);
-    const outputTokens = Math.ceil(fullContent.length / 4);
-
-    return {
-      content: fullContent,
-      inputTokens,
-      outputTokens,
-      metadata: { mode: "cli", provider: PROVIDER_NAME },
-    };
-  }
-
-  async healthCheck(): Promise<{ ok: boolean; message?: string }> {
-    try {
-      const proc = Bun.spawnSync([CLI_BIN, "--version"], {
-        timeout: 5000,
-        stdout: "pipe",
-        stderr: "ignore",
-      });
-      if (proc.exitCode === 0) {
-        return {
-          ok: true,
-          message: `${DISPLAY_NAME} CLI ${proc.stdout.toString().trim()} (mode: cli)`,
-        };
-      }
-      return {
-        ok: false,
-        message: `${DISPLAY_NAME} CLI not available (exit code ${proc.exitCode})`,
-      };
-    } catch {
-      return {
-        ok: false,
-        message: `${DISPLAY_NAME} CLI not installed or not in PATH`,
-      };
-    }
-  }
-
-  async listModels(): Promise<AIModelInfo[]> {
-    try {
-      const proc = Bun.spawnSync([CLI_BIN, "models"], {
-        timeout: 10_000,
-        stdout: "pipe",
-        stderr: "ignore",
-      });
-
-      if (proc.exitCode !== 0) return fallbackModels();
-
-      const models = proc.stdout
-        .toString()
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0 && line.includes("/"));
-
-      return models.length > 0
-        ? models.map(toOpenCodeModelInfo)
-        : fallbackModels();
-    } catch {
-      return fallbackModels();
-    }
-  }
-
-  private buildArgs(model: string, prompt: string): string[] {
-    const args: string[] = ["run"];
-    if (model && model !== "default") args.push("--model", model);
-    args.push(prompt);
-    return args;
   }
 }
 
@@ -723,6 +509,88 @@ interface ManagedSession {
   updatedAt: string;
 }
 
+// ── Managed Server ──────────────────────────────────────────────────────
+
+/**
+ * Owns a single long-lived `opencode serve` process. OpenCode is a server-first
+ * harness: its HTTP API returns clean, structured assistant messages, whereas
+ * a one-shot `opencode run` against a pipe intermittently drops its answer. We
+ * therefore route every request through a managed server (an explicit
+ * OPENCODE_URL operator override still wins).
+ */
+class OpenCodeServerManager {
+  private proc: ReturnType<typeof Bun.spawn> | null = null;
+  private baseUrl: string | null = null;
+  private starting: Promise<string> | null = null;
+
+  async ensure(
+    resolveEnv: () => Promise<Record<string, string>>,
+    log: (level: "info" | "error" | "debug", msg: string) => void,
+  ): Promise<string> {
+    const external = process.env["OPENCODE_URL"]?.trim();
+    if (external) return external;
+    if (this.baseUrl && this.proc && this.proc.exitCode === null) {
+      return this.baseUrl;
+    }
+    if (this.starting) return this.starting;
+    this.starting = this.start(resolveEnv, log).finally(() => {
+      this.starting = null;
+    });
+    return this.starting;
+  }
+
+  private async healthy(baseUrl: string): Promise<boolean> {
+    try {
+      const res = await fetch(`${baseUrl}/api/health`, {
+        signal: AbortSignal.timeout(2000),
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  private async start(
+    resolveEnv: () => Promise<Record<string, string>>,
+    log: (level: "info" | "error" | "debug", msg: string) => void,
+  ): Promise<string> {
+    const port = Number(process.env["OPENCODE_PORT"]) || DEFAULT_PORT;
+    const baseUrl = `http://localhost:${port}`;
+    if (await this.healthy(baseUrl)) {
+      this.baseUrl = baseUrl;
+      return baseUrl;
+    }
+    const env = await resolveEnv();
+    log("info", `Starting managed opencode server on ${baseUrl}`);
+    this.proc = Bun.spawn([CLI_BIN, "serve", "--port", String(port)], {
+      env,
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    for (let i = 0; i < 60; i += 1) {
+      if (await this.healthy(baseUrl)) {
+        this.baseUrl = baseUrl;
+        return baseUrl;
+      }
+      await Bun.sleep(500);
+    }
+    throw new Error(
+      `OpenCode server did not become healthy at ${baseUrl} within 30s`,
+    );
+  }
+
+  shutdown(): void {
+    try {
+      this.proc?.kill();
+    } catch {
+      /* best effort */
+    }
+    this.proc = null;
+    this.baseUrl = null;
+  }
+}
+
 // ── Provider Implementation ─────────────────────────────────────────────
 
 class OpenCodeProvider implements AIAgentProvider {
@@ -732,6 +600,20 @@ class OpenCodeProvider implements AIAgentProvider {
   private hostServices: HostServices | null = null;
   private logger: BoundLogger | null = null;
   private adapter: ProviderAdapter | null = null;
+  private readonly server = new OpenCodeServerManager();
+
+  /** Resolve the OpenCode server base URL, starting a managed server if needed. */
+  private async resolveServerBaseUrl(): Promise<string> {
+    return this.server.ensure(
+      () => this.resolveCliEnv(),
+      (level, msg) => this.log(level, msg),
+    );
+  }
+
+  /** Stop the managed OpenCode server (called on plugin shutdown). */
+  shutdownServer(): void {
+    this.server.shutdown();
+  }
   private currentMode: ProviderMode | null = null;
 
   setHostServices(hs: HostServices) {
@@ -740,6 +622,84 @@ class OpenCodeProvider implements AIAgentProvider {
     const registry = new ProviderRegistry(hs);
     this.logIngester =
       registry.getProvider<LogIngester>("ai", "log-ingester") ?? null;
+  }
+
+  /**
+   * OpenCode resolves provider credentials from its own auth store first and
+   * env vars second. We point it at a scoped data dir (off the operator's
+   * `~/.local/share/opencode`) so a stale/personal `opencode auth login` never
+   * shadows a key the user saved in the agent config bag — then inject those
+   * keys as the env vars OpenCode reads for each upstream provider.
+   */
+  private opencodeDataHome(): string {
+    const home =
+      process.env["OPENCODE_XDG_DATA_HOME"]?.trim() ||
+      join(tmpdir(), "vibe-opencode-data");
+    try {
+      mkdirSync(home, { recursive: true });
+    } catch {
+      /* best effort */
+    }
+    return home;
+  }
+
+  /**
+   * Build the env for an `opencode run` spawn: the agent env, a scoped
+   * XDG_DATA_HOME, plus every upstream provider key resolved from env → the
+   * agent config bag. OpenCode is a multi-provider harness, so we surface all
+   * keys we can and let the chosen `provider/model` pick the right one.
+   */
+  private async resolveCliEnv(): Promise<Record<string, string>> {
+    // Curate the env rather than spreading the whole agent process env: the
+    // long-running daemon carries vars that make `opencode run` route its
+    // answer through a TUI buffer (empty piped stdout). A minimal env — the
+    // shell essentials + a scoped data dir + provider keys — matches a clean
+    // shell invocation and makes the captured output deterministic.
+    const env: Record<string, string> = {
+      XDG_DATA_HOME: this.opencodeDataHome(),
+      CI: "true",
+    };
+    for (const passthrough of [
+      "HOME",
+      "PATH",
+      "USER",
+      "LANG",
+      "LC_ALL",
+      "TMPDIR",
+      "SHELL",
+      "TERM",
+    ]) {
+      const v = process.env[passthrough];
+      if (v) env[passthrough] = v;
+    }
+    // env var name -> config-bag key (same name here, but kept explicit).
+    const keyNames = [
+      "ANTHROPIC_API_KEY",
+      "OPENAI_API_KEY",
+      "OPENROUTER_API_KEY",
+      "GEMINI_API_KEY",
+      "GOOGLE_API_KEY",
+      "GROQ_API_KEY",
+      "MISTRAL_API_KEY",
+      "DEEPSEEK_API_KEY",
+      "OPENCODE_API_KEY",
+    ];
+    for (const name of keyNames) {
+      const fromEnv = process.env[name]?.trim();
+      if (fromEnv) {
+        env[name] = fromEnv;
+        continue;
+      }
+      if (this.hostServices?.getConfig) {
+        try {
+          const v = (await this.hostServices.getConfig(name))?.trim();
+          if (v) env[name] = v;
+        } catch {
+          /* ignore a single key lookup failure */
+        }
+      }
+    }
+    return env;
   }
 
   getSupportedModes(): ProviderMode[] {
@@ -840,8 +800,9 @@ class OpenCodeProvider implements AIAgentProvider {
 
     let remoteSessionId: string | null = null;
 
-    // In SDK mode, create a remote session on the OpenCode server
-    if (this.getMode() === "sdk") {
+    // Both modes run against the managed OpenCode server, so always create a
+    // remote session up front.
+    {
       const adapter = this.getAdapter();
       if (adapter.createRemoteSession) {
         try {
@@ -1034,8 +995,8 @@ class OpenCodeProvider implements AIAgentProvider {
     if (session) {
       if (session.abortController) session.abortController.abort();
 
-      // Cleanup remote session in SDK mode
-      if (session.remoteSessionId && this.getMode() === "sdk") {
+      // Clean up the managed-server remote session.
+      if (session.remoteSessionId) {
         const adapter = this.getAdapter();
         if (adapter.destroyRemoteSession) {
           adapter.destroyRemoteSession(session.remoteSessionId).catch(() => {});
@@ -1092,9 +1053,7 @@ class OpenCodeProvider implements AIAgentProvider {
     maxTokens?: number;
     extras?: Record<string, unknown>;
   }): Promise<{ text: string; usage?: unknown }> {
-    const port = process.env["OPENCODE_PORT"] || String(DEFAULT_PORT);
-    const baseUrl = process.env["OPENCODE_URL"] || `http://localhost:${port}`;
-    const adapter = new OpenCodeSdkAdapter(baseUrl);
+    const adapter = new OpenCodeSdkAdapter(() => this.resolveServerBaseUrl());
     const model = opts.model ?? DEFAULT_MODEL;
     const config: AISessionConfig = {
       name: "vibe-ai-sdk",
@@ -1103,7 +1062,13 @@ class OpenCodeProvider implements AIAgentProvider {
       maxTokens: opts.maxTokens,
       providerConfig: opts.extras,
     };
-    const result = await adapter.sendPrompt(opts.prompt, model, config);
+    const remoteSessionId = await adapter.createRemoteSession(config);
+    const result = await adapter.sendPrompt(
+      opts.prompt,
+      model,
+      config,
+      remoteSessionId,
+    );
     return {
       text: result.content,
       usage: {
@@ -1119,15 +1084,12 @@ class OpenCodeProvider implements AIAgentProvider {
   private getAdapter(): ProviderAdapter {
     if (this.adapter) return this.adapter;
 
-    const mode = this.getMode();
-    if (mode === "sdk") {
-      const port = process.env["OPENCODE_PORT"] || String(DEFAULT_PORT);
-      const baseUrl = process.env["OPENCODE_URL"] || `http://localhost:${port}`;
-      this.adapter = new OpenCodeSdkAdapter(baseUrl);
-    } else {
-      this.adapter = new OpenCodeCliAdapter();
-    }
-
+    // OpenCode is server-first: both "sdk" and "cli" mode route through the
+    // managed `opencode serve` HTTP API, which returns clean structured
+    // responses. (A one-shot `opencode run` against a pipe intermittently drops
+    // its answer, so we do not use it.) The provider's mode is retained for the
+    // UI but does not change the transport here.
+    this.adapter = new OpenCodeSdkAdapter(() => this.resolveServerBaseUrl());
     return this.adapter;
   }
 
@@ -1319,6 +1281,7 @@ const lifecycle = createLifecycleHooks({
     for (const [id] of (provider as OpenCodeProvider)["sessions"]) {
       provider.destroySession(id).catch(() => {});
     }
+    provider.shutdownServer();
   },
 });
 
