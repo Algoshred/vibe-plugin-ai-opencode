@@ -614,6 +614,23 @@ class OpenCodeProvider implements AIAgentProvider {
   shutdownServer(): void {
     this.server.shutdown();
   }
+
+  /**
+   * Lazily create (and cache) the server-side session for a local session. Done
+   * at first prompt rather than at createSession() so the one-time server start
+   * + DB migration is paid under the prompt's (long) timeout, not the create's.
+   */
+  private async ensureRemoteSession(
+    session: ManagedSession,
+    adapter: ProviderAdapter,
+  ): Promise<string | undefined> {
+    if (session.remoteSessionId) return session.remoteSessionId;
+    if (!adapter.createRemoteSession) return undefined;
+    const remoteId = await adapter.createRemoteSession(session.config);
+    session.remoteSessionId = remoteId;
+    this.log("debug", `Remote OpenCode session created: ${remoteId}`);
+    return remoteId;
+  }
   private currentMode: ProviderMode | null = null;
 
   setHostServices(hs: HostServices) {
@@ -798,28 +815,9 @@ class OpenCodeProvider implements AIAgentProvider {
       };
     }
 
-    let remoteSessionId: string | null = null;
-
-    // Both modes run against the managed OpenCode server, so always create a
-    // remote session up front.
-    {
-      const adapter = this.getAdapter();
-      if (adapter.createRemoteSession) {
-        try {
-          remoteSessionId = await adapter.createRemoteSession(config);
-          this.log(
-            "debug",
-            `Remote OpenCode session created: ${remoteSessionId}`,
-          );
-        } catch (err) {
-          this.log(
-            "error",
-            `Failed to create remote session: ${err instanceof Error ? err.message : "unknown"}`,
-          );
-        }
-      }
-    }
-
+    // The server-side session is created lazily on the first prompt (see
+    // ensureRemoteSession) so createSession never blocks on the one-time
+    // `opencode serve` start + DB migration.
     const session: ManagedSession = {
       id,
       config,
@@ -831,7 +829,7 @@ class OpenCodeProvider implements AIAgentProvider {
         estimatedCostUsd: 0,
       },
       files: [],
-      remoteSessionId,
+      remoteSessionId: null,
       abortController: null,
       createdAt: now,
       updatedAt: now,
@@ -875,11 +873,12 @@ class OpenCodeProvider implements AIAgentProvider {
     const adapter = this.getAdapter();
 
     try {
+      const remoteId = await this.ensureRemoteSession(session, adapter);
       const result = await adapter.sendPrompt(
         fullPrompt,
         model,
         session.config,
-        session.remoteSessionId ?? undefined,
+        remoteId,
       );
       const durationMs = Date.now() - startTime;
 
@@ -927,12 +926,13 @@ class OpenCodeProvider implements AIAgentProvider {
     const adapter = this.getAdapter();
 
     try {
+      const remoteId = await this.ensureRemoteSession(session, adapter);
       const result = await adapter.streamPrompt(
         fullPrompt,
         model,
         session.config,
         onChunk ?? (() => {}),
-        session.remoteSessionId ?? undefined,
+        remoteId,
       );
       const durationMs = Date.now() - startTime;
 
