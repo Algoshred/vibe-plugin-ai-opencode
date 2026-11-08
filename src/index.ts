@@ -17,7 +17,6 @@ import type {
 } from "@vibecontrols/plugin-sdk";
 import {
   BoundLogger,
-  ProviderRegistry,
   TelemetryEmitter,
   createLifecycleHooks,
 } from "@vibecontrols/plugin-sdk";
@@ -190,18 +189,6 @@ interface AIAgentProvider {
     maxTokens?: number;
     extras?: Record<string, unknown>;
   }): Promise<{ text: string; usage?: unknown }>;
-}
-
-interface LogIngester {
-  append(input: {
-    sessionId: string;
-    type: AILogType;
-    content: string;
-    tokenCount?: number;
-    model?: string;
-    durationMs?: number;
-    agentMetadata?: Record<string, unknown>;
-  }): unknown;
 }
 
 // ── Adapter Interface ───────────────────────────────────────────────────
@@ -596,7 +583,6 @@ class OpenCodeServerManager {
 class OpenCodeProvider implements AIAgentProvider {
   readonly name = PROVIDER_NAME;
   private sessions = new Map<string, ManagedSession>();
-  private logIngester: LogIngester | null = null;
   private hostServices: HostServices | null = null;
   private logger: BoundLogger | null = null;
   private adapter: ProviderAdapter | null = null;
@@ -636,9 +622,6 @@ class OpenCodeProvider implements AIAgentProvider {
   setHostServices(hs: HostServices) {
     this.hostServices = hs;
     this.logger = new BoundLogger(hs.logger, `${PROVIDER_NAME}-provider`);
-    const registry = new ProviderRegistry(hs);
-    this.logIngester =
-      registry.getProvider<LogIngester>("ai", "log-ingester") ?? null;
   }
 
   /**
